@@ -45,7 +45,7 @@
           specialArgs = {
             inherit inputs adminKeys;
             hostName = name;
-            runners = ["a"];  # 1 runner to avoid port conflicts (see Port Conflicts section)
+            runners = ["a" "b" "c" "d"];  # 4 runners - using concurrency groups to handle port conflicts
           };
         };
     in

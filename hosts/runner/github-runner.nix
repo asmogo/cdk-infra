@@ -109,7 +109,7 @@ in
 
           # Apparently it wasn't restarting on failure, so let's make sure it does
           Restart = lib.mkForce "always";
-          RestartSec = "30s";
+          RestartSec = "5s";  # Reduced from 30s for faster job pickup after ephemeral runner completes
         };
         extraPackages = with pkgs; [
           gawk
