@@ -327,7 +327,13 @@ in
   };
 
   # Basic services
-  services.openssh.enable = true;
+  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      PermitRootLogin = "prohibit-password";
+    };
+  };
   services.resolved.enable = true;
 
   # System packages (will be merged with management scripts below)
@@ -336,6 +342,20 @@ in
   system.stateVersion = "23.11";
   networking.enableIPv6 = true;
   users.users.root.openssh.authorizedKeys.keys = adminKeys;
+
+  # User 'tsk' with sudo privileges
+  users.users.tsk = {
+    isNormalUser = true;
+    createHome = true;
+    home = "/home/tsk";
+    extraGroups = [ "wheel" ]; # Enable sudo for the user
+    openssh.authorizedKeys.keys = adminKeys;
+    hashedPassword = "!"; # Lock password login, only allow SSH key authentication
+  };
+
+  # Allow wheel group to use sudo
+  security.sudo.wheelNeedsPassword = false;
+
   boot.kernelPackages = pkgs.linuxPackages_latest;
   boot.tmp.cleanOnBoot = true;
 
