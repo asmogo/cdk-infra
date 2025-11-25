@@ -1,7 +1,7 @@
 { lib, pkgs, config, hostName, adminKeys, inputs, ... }:
 
 let
-  # Runner names
+  # Runner names - 4 runners for parallel CI capacity
   runnerNames = [ "a" "b" "c" "d" ];
 
   # Helper to generate IP addresses for containers
@@ -23,6 +23,25 @@ let
       privateNetwork = true;
       hostAddress = ips.host;
       localAddress = ips.container;
+
+      # Extra flags combining nspawn config with direct bind mounts
+      # CRITICAL: Include system-call-filter for keyring operations (from fixed version)
+      extraFlags = [
+        "--capability=all"  # Grant all capabilities
+        "--system-call-filter=add_key"  # Allow add_key syscall for keyrings
+        "--system-call-filter=keyctl"  # Allow keyctl syscall for keyrings
+        "--system-call-filter=request_key"  # Allow request_key syscall
+        "--bind-ro=/run/secrets:/run/secrets"
+        "--bind-ro=/run/agenix:/run/agenix"
+        "--bind=/var/cache/runner-${name}:/var/cache/runner-${name}"
+      ];
+
+      # Allow access to devices Docker needs
+      allowedDevices = [
+        { modifier = "rwm"; node = "/dev/fuse"; }
+        { modifier = "rwm"; node = "/dev/net/tun"; }
+        { modifier = "rwm"; node = "char-*"; }
+      ];
 
       # Bind mount for sharing the GitHub token
       bindMounts = {
@@ -61,23 +80,34 @@ let
         boot.tmp.useTmpfs = false;
         boot.tmp.cleanOnBoot = true;
 
-        # Enable Docker inside the container with special configuration
+        # Enable Docker with configuration for running in containers
         virtualisation.docker = {
           enable = true;
+          # Enable docker compose command
+          enableOnBoot = true;
+          # Auto-prune to save space
           autoPrune = {
             enable = true;
             dates = "daily";
           };
-          # Docker daemon needs special config for running in containers
+          # Use daemon settings optimized for container environment with cgroups v2
           daemon.settings = {
-            # Use vfs storage driver for better compatibility in containers
-            storage-driver = "vfs";
-            # Disable some security features that don't work in containers
-            seccomp-profile = "";
-            apparmor = false;
-            selinux-enabled = false;
+            # Use overlay2 storage driver (works with cgroups v2)
+            storage-driver = "overlay2";
+            # Keep network features disabled in containers
+            iptables = false;
+            ip-masq = false;
+            bridge = "none";
+            # Use systemd cgroup driver for cgroups v2
+            exec-opts = [
+              "native.cgroupdriver=systemd"
+            ];
+            # Log level
+            log-level = "warn";
           };
         };
+
+        # Cgroups configuration handled by systemd defaults
 
         # Create github-runner user inside container
         users.groups.github-runner = { };
@@ -85,8 +115,9 @@ let
           isNormalUser = true;
           group = "github-runner";
           home = "/home/github-runner";
-          extraGroups = [ "docker" ];
+          extraGroups = [ "docker" ];  # Need docker group for Docker daemon access
           createHome = true;
+          uid = 1000;  # Fixed UID for consistency
         };
 
         # Create necessary directories
@@ -116,12 +147,48 @@ let
             Restart = lib.mkForce "always";
             RestartSec = "5s";
 
+            # Clean up Docker containers and fix permissions before each new job
+            ExecStartPre = [
+              # Stop and remove all Docker containers
+              "${pkgs.bash}/bin/bash -c '${pkgs.docker}/bin/docker stop $(${pkgs.docker}/bin/docker ps -q) 2>/dev/null || true; ${pkgs.docker}/bin/docker rm $(${pkgs.docker}/bin/docker ps -aq) 2>/dev/null || true'"
+
+              # Remove Docker volumes
+              "${pkgs.bash}/bin/bash -c '${pkgs.docker}/bin/docker volume prune -f 2>/dev/null || true'"
+
+              # MORE AGGRESSIVE cleanup of all Docker-created directories
+              # This specifically targets the misc/keycloak path and other common Docker data dirs
+              "${pkgs.bash}/bin/bash -c 'find /var/lib/github-runner-work -type d \\( -name postgres_data -o -name mysql_data -o -name docker_data -o -name keycloak_data \\) -exec rm -rf {} + 2>/dev/null || true'"
+
+              # Clean up only the DATA directories inside misc/keycloak (preserve config files)
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/postgres_data 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/mysql_data 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/keycloak_data 2>/dev/null || true'"
+
+              # Clean up any leftover Docker compose directories
+              "${pkgs.bash}/bin/bash -c 'find /var/lib/github-runner-work -type d -name .docker -exec rm -rf {} + 2>/dev/null || true'"
+
+              # Fix both ownership AND permissions on the work directory
+              "${pkgs.bash}/bin/bash -c 'chown -R github-runner:github-runner /var/lib/github-runner-work 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'find /var/lib/github-runner-work -type d -exec chmod 755 {} + 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'find /var/lib/github-runner-work -type f -exec chmod 644 {} + 2>/dev/null || true'"
+            ];
+
+            # Clean up after job completes
+            ExecStopPost = [
+              # Stop any leftover Docker containers
+              "${pkgs.bash}/bin/bash -c '${pkgs.docker}/bin/docker stop $(${pkgs.docker}/bin/docker ps -q) 2>/dev/null || true'"
+              # Remove only the DATA directories (preserve keycloak config files)
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/postgres_data 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/mysql_data 2>/dev/null || true'"
+              "${pkgs.bash}/bin/bash -c 'rm -rf /var/lib/github-runner-work/*/cdk/misc/keycloak/keycloak_data 2>/dev/null || true'"
+            ];
+
             # Service overrides from original config
             PrivateUsers = false;
             ProtectHome = false;
             PrivateMounts = false;
             PrivateTmp = false;
-            ProtectSystem = "full";
+            ProtectSystem = false;  # Changed from "full" to false for more permissions
 
             Environment = lib.mkForce [
               "HOME=/home/github-runner"
@@ -131,37 +198,20 @@ let
               "TEMP=/home/github-runner/tmp"
               "TMP=/home/github-runner/tmp"
               "CONTAINER_NAME=${name}"  # So tests can identify which container they're in
+              "PATH=/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              "DOCKER_BUILDKIT=0"  # Disable BuildKit which can have issues in containers
             ];
 
-            # Remove most SystemCallFilter restrictions for Docker compatibility
-            SystemCallFilter = lib.mkForce [];
-
-            # Docker needs additional capabilities inside containers
-            CapabilityBoundingSet = [
-              "CAP_SETUID"
-              "CAP_SETGID"
-              "CAP_SYS_ADMIN"
-              "CAP_NET_ADMIN"
-              "CAP_DAC_OVERRIDE"
-              "CAP_CHOWN"
-              "CAP_FOWNER"
-              "CAP_SETPCAP"
-            ];
-            AmbientCapabilities = [
-              "CAP_SETUID"
-              "CAP_SETGID"
-              "CAP_SYS_ADMIN"
-            ];
-            NoNewPrivileges = false;
-            # Docker needs access to /proc/sys
-            ProtectKernelTunables = false;
-            # Docker needs access to kernel modules
-            ProtectKernelModules = false;
+            # SystemCallFilter and capabilities for Docker in privileged container
+            SystemCallFilter = lib.mkForce [];  # Allow all system calls in privileged container
+            NoNewPrivileges = false;  # Docker needs to escalate privileges
+            KeyringMode = "shared";  # IMPORTANT: Allow access to kernel keyrings
+            PrivateDevices = false;  # Allow access to all devices
+            DevicePolicy = "auto";  # Allow automatic device access
           };
 
           extraPackages = with pkgs; [
             gawk
-            docker
             cachix
             gnupg
             curl
@@ -169,6 +219,39 @@ let
             xz
             git
             nix
+            # Docker wrapper that fixes permissions
+            (writeShellScriptBin "docker" ''
+              # Run the actual docker command
+              ${docker}/bin/docker "$@"
+              RESULT=$?
+
+              # After docker compose up or docker run with volumes, fix permissions
+              if [[ "$1" == "compose" && "$2" == "up" ]] || [[ "$1" == "run" && "$*" == *"-v"* ]]; then
+                (
+                  sleep 3  # Give Docker time to create directories
+                  find /var/lib/github-runner-work -type d \( -name "postgres_data" -o -name "mysql_data" \) -exec chmod -R 755 {} + 2>/dev/null || true
+                ) &
+              fi
+
+              exit $RESULT
+            '')
+            # Add docker-compose wrapper that fixes permissions after running
+            (writeShellScriptBin "docker-compose" ''
+              # Run the actual docker compose command
+              ${docker}/bin/docker compose "$@"
+              RESULT=$?
+
+              # After docker-compose up, fix permissions on any created volumes
+              if [[ "$1" == "up" ]] || [[ "$2" == "up" ]]; then
+                (
+                  sleep 2  # Give Docker time to create directories
+                  echo "Fixing Docker volume permissions..."
+                  find /var/lib/github-runner-work -type d \( -name "postgres_data" -o -name "mysql_data" \) -exec chmod -R 755 {} + 2>/dev/null || true
+                ) &
+              fi
+
+              exit $RESULT
+            '')
           ];
         };
 
@@ -182,11 +265,30 @@ let
           };
         };
 
+        # Service to fix Docker-created file permissions
+        systemd.services.fix-docker-permissions = {
+          description = "Fix permissions for Docker-created files";
+          serviceConfig = {
+            Type = "oneshot";
+            User = "root";
+            ExecStart = "${pkgs.bash}/bin/bash -c '${pkgs.findutils}/bin/find /var/lib/github-runner-work -type d \\( -name postgres_data -o -name mysql_data -o -name keycloak_data \\) -exec chmod -R 755 {} + 2>/dev/null || true; ${pkgs.findutils}/bin/find /var/lib/github-runner-work -type d \\( -name postgres_data -o -name mysql_data -o -name keycloak_data \\) -exec chown -R github-runner:github-runner {} + 2>/dev/null || true; ${pkgs.findutils}/bin/find /var/lib/github-runner-work/*/cdk/misc -type d -exec chmod 755 {} + 2>/dev/null || true; ${pkgs.findutils}/bin/find /var/lib/github-runner-work/*/cdk/misc -type f -exec chmod 644 {} + 2>/dev/null || true; ${pkgs.findutils}/bin/find /var/lib/github-runner-work -type f -user root -exec chown github-runner:github-runner {} + 2>/dev/null || true; ${pkgs.findutils}/bin/find /var/lib/github-runner-work -type f -user root -exec chmod 644 {} + 2>/dev/null || true'";
+          };
+        };
+
         systemd.timers.cleanup-runner-tmp = {
           wantedBy = [ "timers.target" ];
           partOf = [ "cleanup-runner-tmp.service" ];
           timerConfig = {
             OnCalendar = "hourly";
+            Persistent = true;
+          };
+        };
+
+        systemd.timers.fix-docker-permissions = {
+          wantedBy = [ "timers.target" ];
+          partOf = [ "fix-docker-permissions.service" ];
+          timerConfig = {
+            OnCalendar = "*:0/5";  # Every 5 minutes
             Persistent = true;
           };
         };
@@ -304,6 +406,34 @@ in
     (map (name: "d /var/cache/runner-${name} 0755 root root -") runnerNames)
   ];
 
+  # Create systemd-nspawn configuration files for Docker 20.10+ support
+  environment.etc = lib.listToAttrs (map (name: {
+    name = "systemd/nspawn/runner-${name}.nspawn";
+    value = {
+      text = ''
+        [Exec]
+        # Allow Docker to work inside the container
+        SystemCallFilter=add_key keyctl bpf
+        Capability=all
+
+        [Files]
+        # Bind mount necessary for Docker
+        Bind=/sys/fs/bpf
+        BindReadOnly=/sys/module
+        BindReadOnly=/lib/modules
+        # Bind mount for GitHub runner token and secrets
+        BindReadOnly=/run/secrets
+        BindReadOnly=/run/agenix
+        # Optional cache directory
+        Bind=/var/cache/runner-${name}
+
+        [Network]
+        # Use private network as configured
+        Private=yes
+      '';
+    };
+  }) runnerNames);
+
   # Management helper scripts and system packages
   environment.systemPackages = (map lib.lowPrio [
     pkgs.curl
@@ -393,18 +523,45 @@ in
         echo ""
       done
     '')
+
+    (writeShellScriptBin "runner-test-docker" ''
+      echo "Testing Docker functionality in each container..."
+      echo ""
+      for runner in ${lib.concatStringsSep " " runnerNames}; do
+        echo "Container runner-$runner:"
+        if nixos-container run runner-$runner -- true 2>/dev/null; then
+          echo "  Testing Docker hello-world:"
+          nixos-container run runner-$runner -- docker run --rm hello-world 2>&1 | head -5
+          echo "  Testing Alpine echo:"
+          nixos-container run runner-$runner -- docker run --rm alpine echo "Docker works in container runner-$runner!"
+        else
+          echo "  Container not running"
+        fi
+        echo ""
+      done
+    '')
   ]);
 
-  # Host-level cleanup service for all containers
-  systemd.services.cleanup-all-containers = {
-    description = "Cleanup all runner containers";
-    serviceConfig = {
-      Type = "oneshot";
-      ExecStart = "${pkgs.bash}/bin/bash -c '${lib.concatMapStringsSep " ; " (name:
-        "nixos-container run runner-${name} -- docker system prune -af 2>/dev/null || true"
-      ) runnerNames}'";
+  # Host-level services
+  systemd.services = lib.mkMerge ([
+    # Cleanup service for all containers
+    {
+      cleanup-all-containers = {
+        description = "Cleanup all runner containers";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${pkgs.bash}/bin/bash -c '${lib.concatMapStringsSep " ; " (name:
+            "nixos-container run runner-${name} -- docker system prune -af 2>/dev/null || true"
+          ) runnerNames}'";
+        };
+      };
+    }
+  ] ++ (map (name: {
+    "container@runner-${name}" = {
+      after = [ "agenix-install-secrets.service" ];
+      wants = [ "agenix-install-secrets.service" ];
     };
-  };
+  }) runnerNames));
 
   systemd.timers.cleanup-all-containers = {
     wantedBy = [ "timers.target" ];
