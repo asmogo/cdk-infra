@@ -624,6 +624,62 @@ in
       done
     '')
 
+    (writeShellScriptBin "runner-docker-ps" ''
+      # Check if running as root
+      if [ "$EUID" -ne 0 ]; then
+        echo "Error: This command requires root privileges"
+        echo "Please run: sudo runner-docker-ps [a|b|c|d|all]"
+        exit 1
+      fi
+
+      # Function to show docker containers for a runner
+      show_runner_containers() {
+        local runner=$1
+        echo "Container runner-$runner:"
+        if nixos-container run runner-$runner -- true 2>/dev/null; then
+          # Show running containers
+          RUNNING=$(nixos-container run runner-$runner -- docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null)
+          if [ -n "$RUNNING" ]; then
+            echo "$RUNNING"
+          else
+            echo "  No running Docker containers"
+          fi
+          echo ""
+          # Show all containers (including stopped)
+          ALL=$(nixos-container run runner-$runner -- docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null | tail -n +2)
+          if [ -n "$ALL" ]; then
+            STOPPED=$(echo "$ALL" | grep -v "Up " || true)
+            if [ -n "$STOPPED" ]; then
+              echo "  Stopped containers:"
+              echo "$STOPPED" | sed 's/^/    /'
+            fi
+          fi
+        else
+          echo "  Container not running"
+        fi
+        echo ""
+      }
+
+      # If no argument or "all", show all runners
+      if [ $# -eq 0 ] || [ "$1" = "all" ]; then
+        echo "Docker Containers in Runner Containers"
+        echo "======================================"
+        echo ""
+        for runner in ${lib.concatStringsSep " " runnerNames}; do
+          show_runner_containers $runner
+        done
+      else
+        # Show specific runner
+        RUNNER=$1
+        if [[ ! " ${lib.concatStringsSep " " runnerNames} " =~ " $RUNNER " ]]; then
+          echo "Invalid runner name: $RUNNER"
+          echo "Valid options: ${lib.concatStringsSep ", " runnerNames}, all"
+          exit 1
+        fi
+        show_runner_containers $RUNNER
+      fi
+    '')
+
     (writeShellScriptBin "runner-disk-usage" ''
       # Check if running as root
       if [ "$EUID" -ne 0 ]; then
@@ -680,6 +736,75 @@ in
         nixos-container run runner-$1 -- docker system prune -af --volumes
       fi
     '')
+
+    (writeShellScriptBin "runner-storage" ''
+      # Check if running as root
+      if [ "$EUID" -ne 0 ]; then
+        echo "Error: This command requires root privileges"
+        echo "Please run: sudo runner-storage"
+        exit 1
+      fi
+
+      echo "Storage Overview for ${hostName}"
+      echo "========================================"
+      echo ""
+
+      echo "Host Machine Storage:"
+      echo "---------------------"
+      df -h / /var 2>/dev/null | grep -E '^Filesystem|^/' || df -h / 2>/dev/null
+      echo ""
+
+      echo "Runner Containers Storage:"
+      echo "--------------------------"
+      TOTAL_CONTAINER_SIZE=0
+      TOTAL_DOCKER_SIZE=0
+
+      for runner in ${lib.concatStringsSep " " runnerNames}; do
+        if [ -d "/var/lib/nixos-containers/runner-$runner" ]; then
+          # Get container size
+          CONTAINER_SIZE=$(du -sb /var/lib/nixos-containers/runner-$runner 2>/dev/null | cut -f1)
+          CONTAINER_SIZE_HUMAN=$(du -sh /var/lib/nixos-containers/runner-$runner 2>/dev/null | cut -f1)
+
+          # Get Docker size if container is running
+          if nixos-container run runner-$runner -- true 2>/dev/null; then
+            DOCKER_INFO=$(nixos-container run runner-$runner -- docker system df --format "{{.Type}}\t{{.Size}}" 2>/dev/null)
+            DOCKER_IMAGES=$(echo "$DOCKER_INFO" | grep "^Images" | cut -f2 || echo "0B")
+            DOCKER_CONTAINERS=$(echo "$DOCKER_INFO" | grep "^Containers" | cut -f2 || echo "0B")
+            DOCKER_VOLUMES=$(echo "$DOCKER_INFO" | grep "^Local Volumes" | cut -f2 || echo "0B")
+            STATUS="running"
+          else
+            DOCKER_IMAGES="N/A"
+            DOCKER_CONTAINERS="N/A"
+            DOCKER_VOLUMES="N/A"
+            STATUS="stopped"
+          fi
+
+          echo "runner-$runner ($STATUS):"
+          echo "  Total: $CONTAINER_SIZE_HUMAN"
+          if [ "$STATUS" = "running" ]; then
+            echo "  Docker Images:     $DOCKER_IMAGES"
+            echo "  Docker Containers: $DOCKER_CONTAINERS"
+            echo "  Docker Volumes:    $DOCKER_VOLUMES"
+          fi
+          echo ""
+
+          # Add to totals
+          if [ -n "$CONTAINER_SIZE" ]; then
+            TOTAL_CONTAINER_SIZE=$((TOTAL_CONTAINER_SIZE + CONTAINER_SIZE))
+          fi
+        else
+          echo "runner-$runner: Container directory not found"
+          echo ""
+        fi
+      done
+
+      # Show total
+      if [ $TOTAL_CONTAINER_SIZE -gt 0 ]; then
+        TOTAL_HUMAN=$(numfmt --to=iec-i --suffix=B $TOTAL_CONTAINER_SIZE 2>/dev/null || echo "$TOTAL_CONTAINER_SIZE bytes")
+        echo "------------------------------"
+        echo "Total Container Storage: $TOTAL_HUMAN"
+      fi
+    '')
   ]);
 
   # Host-level services
@@ -696,11 +821,24 @@ in
           ) runnerNames}'";
         };
       };
+
+      # Service to ensure GitHub runner token exists before starting containers
+      github-runner-token-ready = {
+        description = "Ensure GitHub runner token is available";
+        wantedBy = [ "multi-user.target" ];
+        before = map (name: "container@runner-${name}.service") runnerNames;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.bash}/bin/bash -c 'while [ ! -f /run/secrets/github-runner/token ]; do echo \"Waiting for GitHub runner token...\"; sleep 1; done; echo \"GitHub runner token is ready\"'";
+          TimeoutStartSec = "60s";
+        };
+      };
     }
   ] ++ (map (name: {
     "container@runner-${name}" = {
-      after = [ "agenix-install-secrets.service" ];
-      wants = [ "agenix-install-secrets.service" ];
+      after = [ "github-runner-token-ready.service" ];
+      requires = [ "github-runner-token-ready.service" ];
     };
   }) runnerNames));
 

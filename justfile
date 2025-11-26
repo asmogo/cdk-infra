@@ -45,3 +45,11 @@ status HOST:
 # Show runner-01 status
 status-runner-01:
   just status cdk-runner-01.cashudevkit.org
+
+# Show storage overview via SSH
+storage HOST:
+  ssh root@{{HOST}} sudo runner-storage
+
+# Show runner-01 storage
+storage-runner-01:
+  just storage cdk-runner-01.cashudevkit.org
