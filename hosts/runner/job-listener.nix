@@ -124,7 +124,7 @@ let
           set -euo pipefail
 
           RUNNER_NAME="$(hostname)"
-          GITHUB_REPO="thesimplekid/cdk"
+          GITHUB_REPO="${githubRepo}"
           TOKEN_FILE="/var/lib/github-runner-token"
           STATE_DIR="/var/lib/github-runner"
           WORK_DIR="/var/lib/github-runner-work"
@@ -198,8 +198,7 @@ let
     }
   '';
 
-  # nspawn configuration for Docker support (generated per-container with token path)
-  # The TOKEN_FILE_PATH placeholder gets replaced with the actual path at runtime
+  # nspawn configuration for Docker support
   # Note: Network settings are handled by nixos-container, not nspawn config
   nspawnConfigTemplate = ''
     [Exec]
@@ -260,15 +259,6 @@ let
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
         "https://api.github.com/repos/$GITHUB_REPO/actions/runners/registration-token" \
-        | ${pkgs.jq}/bin/jq -r '.token'
-    }
-
-    # Get removal token from GitHub
-    get_removal_token() {
-      ${pkgs.curl}/bin/curl -s -X POST \
-        -H "Authorization: token $GITHUB_TOKEN" \
-        -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPO/actions/runners/remove-token" \
         | ${pkgs.jq}/bin/jq -r '.token'
     }
 
@@ -632,15 +622,14 @@ NSPAWN
         cleanup_container "$container"
       done
 
-      # Clean up stale token files (pattern: j*.token)
-      for token_file in "$STATE_DIR"/j*.token; do
-        [ -f "$token_file" ] || continue
-        local container=$(basename "$token_file" .token)
+      # Clean up stale state files (pattern: j*.*)
+      for state_file in "$STATE_DIR"/j*.*; do
+        [ -f "$state_file" ] || continue
+        local filename=$(basename "$state_file")
+        local container=''${filename%%.*}
         if ! $NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -q "^$container$"; then
-          log "Removing stale token file for $container"
-          rm -f "$token_file"
-          rm -f "$STATE_DIR/$container.started"
-          rm -f "$STATE_DIR/$container.jobid"
+          log "Removing stale state file: $state_file"
+          rm -f "$state_file"
         fi
       done
     }
@@ -799,10 +788,8 @@ NSPAWN
       ${pkgs.iproute2}/bin/ip link delete "ve-$container" 2>/dev/null || true
     done
 
-    # Clean up state files
-    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.token
-    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.started
-    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.jobid
+    # Clean up all state files (token, started, jobid, pid, etc.)
+    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.*
 
     echo "Cleanup complete"
   '';
