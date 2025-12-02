@@ -9,18 +9,18 @@ const CONTAINERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("con
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
-    pub job_id: u64,
+    pub slot: usize,
     pub started_at: u64, // unix timestamp
 }
 
 impl ContainerState {
-    pub fn new(job_id: u64) -> Self {
+    pub fn new(slot: usize) -> Self {
         let started_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
 
-        Self { job_id, started_at }
+        Self { slot, started_at }
     }
 
     /// Returns how long this container has been running in seconds

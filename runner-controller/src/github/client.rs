@@ -229,23 +229,6 @@ impl GitHubClient {
         anyhow::bail!("GitHub API DELETE failed after {} retries: {}", MAX_RETRIES, endpoint)
     }
 
-    /// List workflow runs with a specific status
-    pub async fn list_workflow_runs(&self, status: &str) -> Result<Vec<WorkflowRun>> {
-        let endpoint = format!(
-            "/repos/{}/actions/runs?status={}&per_page=100",
-            self.repo, status
-        );
-        let response: WorkflowRunsResponse = self.get(&endpoint).await?;
-        Ok(response.workflow_runs)
-    }
-
-    /// List jobs for a specific workflow run
-    pub async fn list_jobs_for_run(&self, run_id: u64) -> Result<Vec<Job>> {
-        let endpoint = format!("/repos/{}/actions/runs/{}/jobs", self.repo, run_id);
-        let response: JobsResponse = self.get(&endpoint).await?;
-        Ok(response.jobs)
-    }
-
     /// Get a registration token for new runners
     pub async fn get_registration_token(&self) -> Result<String> {
         let endpoint = format!("/repos/{}/actions/runners/registration-token", self.repo);

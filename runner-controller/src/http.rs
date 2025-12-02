@@ -19,15 +19,16 @@ use crate::state::StateDb;
 pub struct AppState {
     pub state_db: Arc<StateDb>,
     pub start_time: Instant,
-    pub max_concurrent: usize,
+    pub pool_size: usize,
     pub poll_interval_seconds: u64,
     pub job_timeout_seconds: u64,
 }
 
 #[derive(Serialize)]
 pub struct StatusResponse {
-    pub active_containers: Vec<ContainerInfo>,
-    pub max_concurrent: usize,
+    pub pool_size: usize,
+    pub active_containers: usize,
+    pub containers: Vec<ContainerInfo>,
     pub poll_interval_seconds: u64,
     pub job_timeout_seconds: u64,
     pub uptime_seconds: u64,
@@ -36,7 +37,7 @@ pub struct StatusResponse {
 #[derive(Serialize)]
 pub struct ContainerInfo {
     pub name: String,
-    pub job_id: u64,
+    pub slot: usize,
     pub running_seconds: u64,
 }
 
@@ -45,25 +46,26 @@ async fn health() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// GET /status - JSON status of all containers
+/// GET /status - JSON status of pool containers
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let containers = match state.state_db.list_containers() {
+    let db_containers = match state.state_db.list_containers() {
         Ok(c) => c,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to list containers").into_response(),
     };
 
-    let active_containers: Vec<ContainerInfo> = containers
+    let containers: Vec<ContainerInfo> = db_containers
         .into_iter()
         .map(|(name, container_state)| ContainerInfo {
             name,
-            job_id: container_state.job_id,
+            slot: container_state.slot,
             running_seconds: container_state.running_seconds(),
         })
         .collect();
 
     let response = StatusResponse {
-        active_containers,
-        max_concurrent: state.max_concurrent,
+        pool_size: state.pool_size,
+        active_containers: containers.len(),
+        containers,
         poll_interval_seconds: state.poll_interval_seconds,
         job_timeout_seconds: state.job_timeout_seconds,
         uptime_seconds: state.start_time.elapsed().as_secs(),

@@ -6,7 +6,7 @@
 let
   # Configuration
   githubRepo = "thesimplekid/cdk";
-  maxConcurrentJobs = 7;
+  maxConcurrentJobs = 4;
   pollIntervalSeconds = 10;
   jobTimeoutSeconds = 7200;  # 2 hours
 
@@ -220,32 +220,21 @@ let
     GITHUB_TOKEN=$(cat /run/secrets/github-runner/token 2>/dev/null || echo "")
     GITHUB_REPO="${githubRepo}"
 
-    echo "=== NixOS Runner Controller Status ==="
+    echo "=== NixOS Runner Controller Status (Warm Pool) ==="
     echo ""
     echo "Controller: $(${pkgs.systemd}/bin/systemctl is-active runner-controller 2>/dev/null || echo 'not running')"
-    echo "Max concurrent jobs: ${toString maxConcurrentJobs}"
+    echo "Pool size: ${toString maxConcurrentJobs}"
     echo "Poll interval: ${toString pollIntervalSeconds}s"
     echo ""
 
-    count=$($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -c '^j[0-9]' 2>/dev/null) || count=0
-    echo "Active containers: $count/${toString maxConcurrentJobs}"
+    count=$($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -cE '^r[0-9]' 2>/dev/null) || count=0
+    echo "Active pool containers: $count/${toString maxConcurrentJobs}"
     echo ""
 
     if [ "$count" -gt 0 ]; then
-      echo "Running jobs:"
-      for container in $($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep "^j[0-9]" || true); do
-        jobid_file="$STATE_DIR/$container.jobid"
-        started_file="$STATE_DIR/$container.started"
-        job_id="unknown"
-        [ -f "$jobid_file" ] && job_id=$(cat "$jobid_file")
-        if [ -f "$started_file" ]; then
-          started=$(cat "$started_file")
-          now=$(${pkgs.coreutils}/bin/date +%s)
-          age=$((now - started))
-          echo "  $container (job $job_id, running ''${age}s)"
-        else
-          echo "  $container (job $job_id)"
-        fi
+      echo "Pool slots:"
+      for container in $($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -E "^r[0-9]" || true); do
+        echo "  $container"
       done
       echo ""
     fi
@@ -275,7 +264,8 @@ let
       -H "Accept: application/vnd.github.v3+json" \
       "https://api.github.com/repos/$GITHUB_REPO/actions/runners?per_page=100")
 
-    active_containers=$($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep "^j[0-9]" || echo "")
+    # Match both old j* and new r* container names
+    active_containers=$($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -E "^[jr][0-9]" || echo "")
 
     echo "$runners" | ${pkgs.jq}/bin/jq -r '.runners[] | select(.status == "offline") | "\(.id) \(.name)"' | while read -r id name; do
       if echo "$active_containers" | ${pkgs.gnugrep}/bin/grep -q "^$name$"; then
@@ -330,9 +320,10 @@ let
       fi
     }
 
-    echo "Stopping and destroying all job containers..."
+    echo "Stopping and destroying all runner containers..."
 
-    for container in $($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep "^j[0-9]" || true); do
+    # Match both old j* and new r* container names
+    for container in $($NIXOS_CONTAINER list 2>/dev/null | ${pkgs.gnugrep}/bin/grep -E "^[jr][0-9]" || true); do
       echo "Cleaning up: $container"
 
       deregister_runner "$container"
@@ -343,8 +334,8 @@ let
       ${pkgs.iproute2}/bin/ip link delete "ve-$container" 2>/dev/null || true
     done
 
-    # Clean up all state files (token, started, jobid, pid, etc.)
-    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.*
+    # Clean up all state files (both old j* and new r* patterns)
+    ${pkgs.coreutils}/bin/rm -f "$STATE_DIR"/j*.* "$STATE_DIR"/r*.*
 
     echo "Cleanup complete"
   '';

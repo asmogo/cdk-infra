@@ -17,7 +17,7 @@ use config::Config;
 use container::ContainerManager;
 use github::GitHubClient;
 use http::AppState;
-use listener::JobListener;
+use listener::PoolController;
 use state::StateDb;
 
 #[tokio::main]
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("runner-controller starting");
+    tracing::info!("runner-controller (warm pool mode) starting");
 
     let start_time = Instant::now();
 
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     tracing::info!(
         repo = %config.github_repo,
-        max_concurrent = config.max_concurrent_jobs,
+        pool_size = config.max_concurrent_jobs,
         poll_interval = ?config.poll_interval,
         labels = ?config.runner_labels,
         http_port = config.http_port,
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     let http_state = AppState {
         state_db: Arc::clone(&state_db),
         start_time,
-        max_concurrent: config.max_concurrent_jobs,
+        pool_size: config.max_concurrent_jobs,
         poll_interval_seconds: config.poll_interval.as_secs(),
         job_timeout_seconds: config.job_timeout.as_secs(),
     };
@@ -80,8 +80,8 @@ async fn main() -> Result<()> {
     let http_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(http::run_server(http_addr, http_state, http_shutdown_rx));
 
-    // Create job listener
-    let mut listener = JobListener::new(
+    // Create pool controller
+    let mut controller = PoolController::new(
         config.clone(),
         github,
         Arc::clone(&containers),
@@ -110,10 +110,10 @@ async fn main() -> Result<()> {
     });
 
     // Run the main loop
-    let result = listener.run().await;
+    let result = controller.run().await;
 
     // Graceful shutdown
-    listener.shutdown().await?;
+    controller.shutdown().await?;
 
     tracing::info!("runner-controller stopped");
 

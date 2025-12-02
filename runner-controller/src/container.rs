@@ -83,7 +83,7 @@ impl ContainerManager {
         matches!(result, Ok(status) if status.success())
     }
 
-    /// List all job containers (names starting with 'j' followed by digits)
+    /// List all pool containers (names starting with 'r' followed by digits)
     pub async fn list(&self) -> Result<Vec<String>> {
         let output = self.run_container_cmd(&["list"]).await?;
 
@@ -91,7 +91,24 @@ impl ContainerManager {
             .lines()
             .map(|s| s.trim().to_string())
             .filter(|name| {
-                name.starts_with('j')
+                name.starts_with('r')
+                    && name.len() > 1
+                    && name[1..].chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+
+        Ok(containers)
+    }
+
+    /// List all runner containers (both old j* and new r* style for migration)
+    pub async fn list_all(&self) -> Result<Vec<String>> {
+        let output = self.run_container_cmd(&["list"]).await?;
+
+        let containers: Vec<String> = output
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|name| {
+                (name.starts_with('r') || name.starts_with('j'))
                     && name.len() > 1
                     && name[1..].chars().all(|c| c.is_ascii_digit())
             })
@@ -102,7 +119,7 @@ impl ContainerManager {
 
     /// Get a free subnet octet in the 100-199 range
     pub async fn get_free_subnet(&self) -> Result<u8> {
-        let containers = self.list().await?;
+        let containers = self.list_all().await?;
         let mut used_subnets = HashSet::new();
 
         for container in containers {
@@ -126,15 +143,9 @@ impl ContainerManager {
         Ok(100)
     }
 
-    /// Convert job ID to container name (j + last 7 digits)
-    pub fn job_id_to_container_name(job_id: u64) -> String {
-        let id_str = job_id.to_string();
-        let suffix = if id_str.len() > 7 {
-            &id_str[id_str.len() - 7..]
-        } else {
-            &id_str
-        };
-        format!("j{}", suffix)
+    /// Convert pool slot index to container name (r + slot number)
+    pub fn slot_to_container_name(slot: usize) -> String {
+        format!("r{}", slot)
     }
 
     /// Write nspawn configuration for Docker support
@@ -149,20 +160,20 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Create and start a container for a job
-    pub async fn spawn_container(&self, job_id: u64, token: &str) -> Result<String> {
-        let name = Self::job_id_to_container_name(job_id);
+    /// Create and start a container for a pool slot
+    pub async fn spawn_pool_container(&self, slot: usize, token: &str) -> Result<String> {
+        let name = Self::slot_to_container_name(slot);
         let subnet = self.get_free_subnet().await?;
 
         info!(
             name = %name,
-            job_id,
+            slot,
             subnet,
-            "Spawning container"
+            "Spawning pool container"
         );
 
         // Clean up any existing container with same name
-        if self.list().await?.contains(&name) {
+        if self.list_all().await?.contains(&name) {
             warn!(name = %name, "Cleaning up existing container first");
             self.cleanup_container(&name).await?;
         }
@@ -223,7 +234,7 @@ impl ContainerManager {
         // Clean up temp token file (already copied into container)
         let _ = std::fs::remove_file(&token_file);
 
-        info!(name = %name, job_id, "Container started");
+        info!(name = %name, slot, "Pool container started");
         Ok(name)
     }
 
@@ -333,10 +344,5 @@ impl ContainerManager {
 
         info!(name = %name, "Container cleaned up");
         Ok(())
-    }
-
-    /// Count active containers
-    pub async fn count_active(&self) -> Result<usize> {
-        Ok(self.list().await?.len())
     }
 }
