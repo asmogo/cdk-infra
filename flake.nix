@@ -12,9 +12,28 @@
 
   outputs = { nixpkgs, disko, agenix, ... }@inputs:
     let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+
       adminKeys = [
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJiA6Oq79afOa48iyOVfs7iVbs3Ug9Elj8GdtWLs2UcD tsk@thesimplekid.com"
       ];
+
+      # Rust runner controller package
+      runnerController = pkgs.rustPlatform.buildRustPackage {
+        pname = "runner-controller";
+        version = "0.1.0";
+        src = ./runner-controller;
+        cargoLock.lockFile = ./runner-controller/Cargo.lock;
+
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.openssl ];
+
+        meta = {
+          description = "GitHub Actions Runner Controller for NixOS containers";
+          license = pkgs.lib.licenses.mit;
+        };
+      };
 
       topLevelModule = {
         nixpkgs = {
@@ -30,7 +49,7 @@
 
       makeRunnerVps = name:
         nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
+          inherit system;
           modules = [
             topLevelModule
             ./modules/nixos-nixpkgs-last-modified.nix
@@ -39,27 +58,54 @@
             agenix.nixosModules.default
 
             ./disk-config/hetzner-vps.nix
-            ./hosts/runner/job-listener.nix  # On-demand containers (ARC-style)
+            ./hosts/runner/runner-controller.nix  # On-demand containers (ARC-style)
             ./hosts/runner/container-resource-limits.nix
             ./hosts/runner/hardware-configuration-amd.nix
           ];
           specialArgs = {
-            inherit inputs adminKeys;
+            inherit inputs adminKeys runnerController;
             hostName = name;
           };
         };
     in
     {
+      # Expose the package
+      packages.${system} = {
+        runner-controller = runnerController;
+        default = runnerController;
+      };
+
       nixosConfigurations = {
         cdk-runner-01 = makeRunnerVps "cdk-runner-01";
       };
 
       devShells.x86_64-linux.default =
-        nixpkgs.legacyPackages.x86_64-linux.mkShell {
-          packages = with nixpkgs.legacyPackages.x86_64-linux; [
+        let
+          pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        in
+        pkgs.mkShell {
+          packages = [
             agenix.packages.x86_64-linux.default
-            just
+            pkgs.just
+
+            # Rust toolchain
+            pkgs.rustc
+            pkgs.cargo
+            pkgs.rustfmt
+            pkgs.clippy
+
+            # Rust development tools
+            pkgs.rust-analyzer
+            pkgs.cargo-watch
+            pkgs.cargo-nextest
+
+            # Build dependencies
+            pkgs.pkg-config
+            pkgs.openssl
           ];
+
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         };
     };
 }
